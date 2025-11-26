@@ -1,0 +1,117 @@
+# .github/workflows/main.yml
+name: Product Catalog CI/CD
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch: # Allows manual trigger
+
+# Define reusable variables
+env:
+  DOCKER_IMAGE_NAME: product-catalog
+  DOCKER_REGISTRY: docker.io
+  DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+  DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+  K8S_HOST: ${{ secrets.K8S_STAGING_HOST }} # Example for SSH/Deployment target
+
+jobs:
+  build-and-test:
+    name: Build, Test, and Push Image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies and run tests
+        run: |
+          pip install -r requirements.txt
+          python -m unittest test_app.py
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ env.DOCKER_USERNAME }}
+          password: ${{ env.DOCKER_PASSWORD }}
+
+      - name: Build and push Docker image
+        id: docker_build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ env.DOCKER_USERNAME }}/${{ env.DOCKER_IMAGE_NAME }}:${{ github.sha }} # Tag image with unique Git SHA
+
+      - name: Save image tag for later stages
+        run: echo "IMAGE_TAG=${{ env.DOCKER_USERNAME }}/${{ env.DOCKER_IMAGE_NAME }}:${{ github.sha }}" >> $GITHUB_ENV
+
+    outputs:
+      image_tag: ${{ env.IMAGE_TAG }}
+
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    environment: staging # Links to GitHub environment (useful for secrets/approvals)
+
+    steps:
+      - name: Deploy to Staging K8s/Docker Host
+        # In a real-world scenario, you would use 'uses: azure/k8s-deploy@v4' or a similar action.
+        # For demonstration, we use SSH to run a deployment command.
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ env.K8S_HOST }}
+          username: ${{ secrets.SSH_USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            echo "Pulling image: ${{ needs.build-and-test.outputs.image_tag }}"
+            # Example command to run the new container on the staging server
+            docker pull ${{ needs.build-and-test.outputs.image_tag }}
+            docker stop product-catalog-staging || true
+            docker rm product-catalog-staging || true
+            docker run -d --name product-catalog-staging -p 8080:5000 ${{ needs.build-and-test.outputs.image_tag }}
+            echo "Staging deployment complete. Check http://${{ env.K8S_HOST }}:8080/health"
+
+  # Requires manual approval on the GitHub UI before proceeding
+  production-approval:
+    name: Manual Approval for Production
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    environment:
+      name: production
+      url: https://your-ecommerce-domain.com/products
+    steps:
+      - run: echo "Waiting for manual approval to start the Canary Deployment to Production..."
+
+  deploy-production-canary:
+    name: Canary Deployment to Production
+    runs-on: ubuntu-latest
+    needs: production-approval
+    steps:
+      - name: Deploy Canary (20% traffic)
+        run: |
+          # This is where your sophisticated deployment tool (e.g., Helm/kubectl/ArgoCD)
+          # would apply a manifest to the K8s cluster that implements the Canary strategy.
+          
+          # Example concept: Apply K8s manifest using the validated image tag
+          # kubectl apply -f k8s/canary-deployment.yaml --set image.tag=${{ needs.build-and-test.outputs.image_tag }}
+          
+          echo "INFO: Deployed new version as a 20% traffic Canary."
+
+      - name: Wait for Monitoring (Simulated)
+        run: |
+          echo "INFO: Pausing for 5 minutes for monitoring (Prometheus/Grafana) to assess health..."
+          # In a real pipeline, this would be an automated check against monitoring metrics.
+          sleep 300 # Wait for 5 minutes
+
+      - name: Full Production Rollout (100% traffic)
+        run: |
+          # kubectl apply -f k8s/full-deployment.yaml --set image.tag=${{ needs.build-and-test.outputs.image_tag }}
+          echo "INFO: Canary successful. Scaling the new version to 100% traffic and removing the old version."
